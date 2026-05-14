@@ -7,6 +7,7 @@
 ![Apple Silicon](https://img.shields.io/badge/Apple%20Silicon-M1%2FM2-green)
 ![Intel](https://img.shields.io/badge/Intel-supported-lightgrey)
 ![License: MIT](https://img.shields.io/badge/License-MIT-yellow)
+[![GitHub](https://img.shields.io/github/stars/waltinho17/touchbar-temp?style=social)](https://github.com/waltinho17/touchbar-temp)
 
 ---
 
@@ -45,7 +46,7 @@
 ### Opção 1 — Terminal (recomendado)
 
 ```bash
-git clone https://github.com/YOUR_USERNAME/touchbar-temp.git
+git clone https://github.com/waltinho17/touchbar-temp.git
 cd touchbar-temp
 make run
 ```
@@ -53,7 +54,7 @@ make run
 ### Opção 2 — Xcode
 
 ```bash
-git clone https://github.com/YOUR_USERNAME/touchbar-temp.git
+git clone https://github.com/waltinho17/touchbar-temp.git
 cd touchbar-temp
 open Package.swift
 ```
@@ -62,7 +63,7 @@ Build & Run no Xcode (⌘R).
 
 ### Opção 3 — Release pronto
 
-Baixe o `.app` na [página de Releases](../../releases) e arraste para `/Applications`.
+Baixe o `.app` na [página de Releases](https://github.com/waltinho17/touchbar-temp/releases) e arraste para `/Applications`.
 
 ---
 
@@ -122,7 +123,7 @@ Ideias para futuras versões:
 
 ## 📄 Licença / License
 
-MIT © [Walter Rodrigues](https://github.com/YOUR_USERNAME)
+MIT © [Walter Rodrigues](https://github.com/waltinho17)
 
 ---
 
