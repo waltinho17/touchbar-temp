@@ -63,7 +63,15 @@ Build & Run no Xcode (⌘R).
 
 ### Opção 3 — Release pronto
 
-Baixe o `.app` na [página de Releases](https://github.com/waltinho17/touchbar-temp/releases) e arraste para `/Applications`.
+Baixe o `.app` na [página de Releases](https://github.com/waltinho17/touchbar-temp/releases), descompacte e rode no Terminal:
+
+```bash
+xattr -cr "TouchBar Temp.app"
+```
+
+Depois arraste para `/Applications` e abra normalmente.
+
+> O `xattr -cr` remove o bloqueio do Gatekeeper (necessário por não ter assinatura de desenvolvedor pago). O código é 100% aberto.
 
 ---
 
