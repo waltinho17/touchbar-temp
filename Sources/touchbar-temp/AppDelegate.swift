@@ -9,6 +9,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationDidFinishLaunching(_ notification: Notification) {
         setupStatusBar()
         touchBarController.start(reader: temperatureReader)
+        scheduleMenuBarUpdate()
+    }
+
+    private func scheduleMenuBarUpdate() {
+        updateMenuBarTemp()
+        let t = Timer(timeInterval: 3.0, repeats: true) { [weak self] _ in self?.updateMenuBarTemp() }
+        RunLoop.main.add(t, forMode: .common)
+    }
+
+    private func updateMenuBarTemp() {
+        let temp = temperatureReader.currentTemperature()
+        guard let button = statusItem.button else { return }
+        if temp > 0 {
+            button.image = nil
+            button.title = String(format: "%.0f°C", temp)
+        } else {
+            button.image = NSImage(systemSymbolName: "thermometer.medium",
+                                   accessibilityDescription: "TouchBar Temp")
+            button.title = ""
+        }
     }
 
     // MARK: - Status Bar

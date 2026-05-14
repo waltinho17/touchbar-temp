@@ -5,6 +5,7 @@ final class TouchBarController: NSObject, NSTouchBarDelegate {
 
     private let itemID = NSTouchBarItem.Identifier("com.touchbar-temp.temperature")
     private var systemTrayItem: NSCustomTouchBarItem?  // must be retained
+    private var touchBarRef: NSTouchBar?               // must be retained
     private weak var tempButton: NSButton?
     private var timer: Timer?
     private var reader: TemperatureReader?
@@ -55,35 +56,46 @@ final class TouchBarController: NSObject, NSTouchBarDelegate {
 
     // MARK: - System Tray Injection
 
-    // Tries addSystemTrayItem: on NSTouchBarItem (private, stable since 10.12.2).
-    // Falls back to the 2-arg presentSystemModalTouchBar:systemTrayItemIdentifier:
-    // which shows the item in the system tray without replacing the whole bar.
+    // Shows the temperature in the Touch Bar system tray (right side, next to Siri).
+    //
+    // How it works:
+    //  1. presentSystemModalTouchBar:placement:1 — registers our item as the
+    //     "system tray item" and briefly shows a modal Touch Bar.
+    //  2. After 400ms, minimizeSystemModalTouchBar: — collapses the modal back to
+    //     the app's normal Touch Bar while keeping the temperature icon in the
+    //     system tray area. This is the same pattern used by apps like Silenz.
     private func addToSystemTray(_ item: NSCustomTouchBarItem) {
-        if callClassMethod("addSystemTrayItem:", on: NSTouchBarItem.self, arg: item) { return }
-
-        // Fallback: 2-arg presentSystemModalTouchBar (no placement = system tray only)
         let bar = NSTouchBar()
         bar.delegate = self
         bar.defaultItemIdentifiers = [itemID]
+        self.touchBarRef = bar
 
-        typealias PresentFn = @convention(c) (AnyObject, Selector, AnyObject?, NSString?) -> Void
-        let sel = NSSelectorFromString("presentSystemModalTouchBar:systemTrayItemIdentifier:")
-        guard let method = class_getClassMethod(NSTouchBar.self, sel) else { return }
-        let fn = unsafeBitCast(method_getImplementation(method), to: PresentFn.self)
-        fn(NSTouchBar.self, sel, bar, itemID.rawValue as NSString)
+        presentModal(bar)
+
+        // Brief delay so the system registers the modal before we minimize it
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) { [weak self] in
+            guard let self else { return }
+            self.minimizeModal(self.touchBarRef)
+        }
     }
 
-    @discardableResult
-    private func callClassMethod(_ name: String, on cls: AnyClass, arg: AnyObject) -> Bool {
-        let sel = NSSelectorFromString(name)
-        guard let method = class_getClassMethod(cls, sel) else { return false }
-        typealias Fn = @convention(c) (AnyObject, Selector, AnyObject) -> Void
-        let fn = unsafeBitCast(method_getImplementation(method), to: Fn.self)
-        fn(cls, sel, arg)
-        return true
+    private func presentModal(_ bar: NSTouchBar) {
+        typealias Fn = @convention(c) (AnyObject, Selector, AnyObject?, Int64, NSString?) -> Void
+        let sel = NSSelectorFromString("presentSystemModalTouchBar:placement:systemTrayItemIdentifier:")
+        guard let m = class_getClassMethod(NSTouchBar.self, sel) else { return }
+        let fn = unsafeBitCast(method_getImplementation(m), to: Fn.self)
+        fn(NSTouchBar.self, sel, bar, 1, itemID.rawValue as NSString)
     }
 
-    // MARK: - NSTouchBarDelegate (fallback path)
+    private func minimizeModal(_ bar: NSTouchBar?) {
+        typealias Fn = @convention(c) (AnyObject, Selector, AnyObject?) -> Void
+        let sel = NSSelectorFromString("minimizeSystemModalTouchBar:")
+        guard let m = class_getClassMethod(NSTouchBar.self, sel) else { return }
+        let fn = unsafeBitCast(method_getImplementation(m), to: Fn.self)
+        fn(NSTouchBar.self, sel, bar)
+    }
+
+    // MARK: - NSTouchBarDelegate
 
     func touchBar(_ touchBar: NSTouchBar,
                   makeItemForIdentifier identifier: NSTouchBarItem.Identifier) -> NSTouchBarItem? {
