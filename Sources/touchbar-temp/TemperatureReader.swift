@@ -1,50 +1,90 @@
 import IOKit
-import Foundation
+import Darwin
 
-// Reads CPU temperature from the System Management Controller (SMC).
-// Tries a prioritized list of sensor keys compatible with Intel and Apple Silicon.
+// Reads temperature from the Mac's thermal sensors.
+//
+// Apple Silicon: uses IOHIDEventSystemClient to query AppleARMPMUTempSensor
+//                (PrimaryUsagePage 0xFF00, PrimaryUsage 0x0005).
+//                These functions are in IOKit.framework but absent from
+//                public Swift headers; we load them via dlsym at runtime.
+//
+// Intel fallback: traditional IOConnectCallStructMethod on AppleSMC.
+
 final class TemperatureReader {
 
-    private var conn: io_connect_t = 0
-    private var connected = false
-
-    // Intel: TC0P (CPU proximity), TC0D/E/F (CPU die)
-    // Apple Silicon M1/M2: Tp01–Tp0r (PMIC), Tf04/Tf09 (P-cores/E-cores), Te05/Te09
-    private let candidateKeys = ["TC0P", "TC0D", "TC0E", "TC0F",
-                                  "Tp01", "Tp05", "Tp09", "Tp0D", "Tp0T",
-                                  "Tp0b", "Tp0d", "Tp0f", "Tp0h", "Tp0j",
-                                  "Tf04", "Tf09", "Tf0A", "Tf0B",
-                                  "Te05", "Te09"]
     private var cachedKey: String?
+    private var scanned = false
+
+    // Intel SMC connection (unused on Apple Silicon, kept for Intel fallback)
+    private var smcConn: io_connect_t = 0
+    private var smcConnected = false
+
+    // Private IOHIDEventSystemClient functions, loaded once
+    private let hid: HIDFunctions?
 
     init() {
-        // Verify struct matches the C SMCKeyData_t layout exactly (80 bytes).
-        // If this assertion fires, the temperature reading will silently fail.
-        assert(MemoryLayout<SMCKeyData>.size == 80, "SMCKeyData layout mismatch: got \(MemoryLayout<SMCKeyData>.size), expected 80")
-        openConnection()
+        hid = HIDFunctions()
+        let svc = IOServiceGetMatchingService(kIOMainPortDefault, IOServiceMatching("AppleSMC"))
+        if svc != 0 {
+            defer { IOObjectRelease(svc) }
+            smcConnected = IOServiceOpen(svc, mach_task_self_, 0, &smcConn) == kIOReturnSuccess
+        }
     }
-    deinit { if connected { IOServiceClose(conn) } }
+
+    deinit { if smcConnected { IOServiceClose(smcConn) } }
 
     // MARK: - Public
 
     func currentTemperature() -> Double {
-        if let key = cachedKey, let t = readKey(key), valid(t) { return t }
-        return scanForTemperature()
+        if let t = hidTemperature(), t > 0 { return t }
+        return intelSMCTemperature()
     }
 
-    // MARK: - Connection
+    // MARK: - Apple Silicon (IOHIDEventSystem)
 
-    private func openConnection() {
-        let service = IOServiceGetMatchingService(kIOMainPortDefault,
-                                                  IOServiceMatching("AppleSMC"))
-        guard service != 0 else { return }
-        defer { IOObjectRelease(service) }
-        connected = IOServiceOpen(service, mach_task_self_, 0, &conn) == kIOReturnSuccess
+    private func hidTemperature() -> Double? {
+        guard let fn = hid else { return nil }
+
+        let client = fn.create(kCFAllocatorDefault)
+
+        // Match AppleARMPMUTempSensor: AppleVendor usage page, TemperatureSensor usage
+        let matching: CFDictionary = [
+            "PrimaryUsagePage": 0xFF00,
+            "PrimaryUsage":     0x0005
+        ] as CFDictionary
+        fn.setMatching(client, matching)
+
+        guard let services = fn.copyServices(client) else {
+            cfRelease(client)
+            return nil
+        }
+
+        var maxTemp = 0.0
+        for i in 0..<CFArrayGetCount(services) {
+            guard let raw = CFArrayGetValueAtIndex(services, i) else { continue }
+            let service = OpaquePointer(raw)
+            guard let event = fn.copyEvent(service, 15, 0, 0.0) else { continue }
+            let temp = fn.getFloat(event, UInt32(15) << 16)
+            cfRelease(event)
+            // Filter: valid temperatures are between 1 and 120 °C
+            if temp > 1 && temp < 120 && temp > maxTemp { maxTemp = temp }
+        }
+
+        cfRelease(services)
+        cfRelease(client)
+        return maxTemp > 0 ? maxTemp : nil
     }
 
-    private func scanForTemperature() -> Double {
-        for key in candidateKeys {
-            if let t = readKey(key), valid(t) {
+    // MARK: - Intel SMC fallback
+
+    private func intelSMCTemperature() -> Double {
+        if let key = cachedKey, let t = smcRead(key), valid(t) { return t }
+        if scanned { return 0 }
+        scanned = true
+
+        let keys = ["TC0P", "TC0D", "TC0E", "TC0F"]
+        for key in keys {
+            if let t = smcRead(key), valid(t) {
                 cachedKey = key
                 return t
             }
@@ -54,10 +94,10 @@ final class TemperatureReader {
 
     private func valid(_ t: Double) -> Bool { t > 1 && t < 120 }
 
-    // MARK: - SMC Read
+    // MARK: - SMC Read (Intel)
 
-    private func readKey(_ key: String) -> Double? {
-        guard connected else { return nil }
+    private func smcRead(_ key: String) -> Double? {
+        guard smcConnected else { return nil }
 
         var input = SMCKeyData()
         var output = SMCKeyData()
@@ -65,50 +105,80 @@ final class TemperatureReader {
 
         input.key = fourCC(key)
         input.data8 = 9  // kSMCGetKeyInfo
-
-        guard IOConnectCallStructMethod(conn, 2, &input, size, &output, &size) == kIOReturnSuccess,
+        guard IOConnectCallStructMethod(smcConn, 2, &input, size, &output, &size) == kIOReturnSuccess,
               output.result == 0 else { return nil }
 
-        let dataSize = output.keyInfo_dataSize
-        let dataType = output.keyInfo_dataType
-
-        input.keyInfo_dataSize = dataSize
+        input.keyInfo_dataSize = output.keyInfo_dataSize
         input.data8 = 5  // kSMCReadKey
         size = MemoryLayout<SMCKeyData>.size
-
-        guard IOConnectCallStructMethod(conn, 2, &input, size, &output, &size) == kIOReturnSuccess,
+        guard IOConnectCallStructMethod(smcConn, 2, &input, size, &output, &size) == kIOReturnSuccess,
               output.result == 0 else { return nil }
 
-        return parseTemperature(bytes: output.bytes, type: dataType)
+        return parseTemp(bytes: output.bytes, type: output.keyInfo_dataType)
     }
 
     private func fourCC(_ s: String) -> UInt32 {
         s.utf8.reduce(0) { $0 << 8 | UInt32($1) }
     }
 
-    private func parseTemperature(bytes b: SMCKeyData.Bytes, type: UInt32) -> Double? {
+    private func parseTemp(bytes b: SMCKeyData.Bytes, type: UInt32) -> Double? {
         switch type {
-        case fourCC("sp78"):
-            // Fixed-point signed 7.8: integer part in byte 0, fractional in byte 1
-            return Double(b.0) + Double(b.1) / 256.0
+        case fourCC("sp78"): return Double(b.0) + Double(b.1) / 256.0
         case fourCC("flt "):
-            // IEEE 754 single precision, big-endian
             let bits = UInt32(b.0) << 24 | UInt32(b.1) << 16 | UInt32(b.2) << 8 | UInt32(b.3)
             return Double(Float(bitPattern: bits))
-        case fourCC("ui16"):
-            return Double(UInt16(b.0) << 8 | UInt16(b.1))
-        default:
-            return nil
+        default: return nil
         }
+    }
+
+    // MARK: - CF helpers
+
+    private func cfRelease(_ ptr: OpaquePointer) {
+        Unmanaged<AnyObject>.fromOpaque(UnsafeRawPointer(ptr)).release()
+    }
+
+    private func cfRelease(_ arr: CFArray) {
+        // CFArray is an ARC-managed CF type in Swift; explicit release via OpaquePointer
+        cfRelease(OpaquePointer(Unmanaged.passUnretained(arr).toOpaque()))
     }
 }
 
-// MARK: - SMC Struct
+// MARK: - IOHIDEventSystemClient (private API, loaded dynamically from IOKit.framework)
+
+private struct HIDFunctions {
+    let create:      @convention(c) (CFAllocator?) -> OpaquePointer
+    let setMatching: @convention(c) (OpaquePointer, CFDictionary) -> Void
+    let copyServices: @convention(c) (OpaquePointer) -> CFArray?
+    let copyEvent:   @convention(c) (OpaquePointer, UInt32, UInt32, Double) -> OpaquePointer?
+    let getFloat:    @convention(c) (OpaquePointer, UInt32) -> Double
+
+    init?() {
+        // dlopen(nil) gives a handle that resolves symbols from all loaded images,
+        // including IOKit.framework which is always linked by our app.
+        let lib = dlopen(nil, RTLD_LAZY)
+
+        guard
+            let pCreate  = dlsym(lib, "IOHIDEventSystemClientCreate"),
+            let pSetMatch = dlsym(lib, "IOHIDEventSystemClientSetMatching"),
+            let pCopySvc = dlsym(lib, "IOHIDEventSystemClientCopyServices"),
+            let pCopyEvt = dlsym(lib, "IOHIDServiceClientCopyEvent"),
+            let pGetFlt  = dlsym(lib, "IOHIDEventGetFloatValue")
+        else { return nil }
+
+        create       = unsafeBitCast(pCreate,   to: (@convention(c) (CFAllocator?) -> OpaquePointer).self)
+        setMatching  = unsafeBitCast(pSetMatch, to: (@convention(c) (OpaquePointer, CFDictionary) -> Void).self)
+        copyServices = unsafeBitCast(pCopySvc,  to: (@convention(c) (OpaquePointer) -> CFArray?).self)
+        copyEvent    = unsafeBitCast(pCopyEvt,  to: (@convention(c) (OpaquePointer, UInt32, UInt32, Double) -> OpaquePointer?).self)
+        getFloat     = unsafeBitCast(pGetFlt,   to: (@convention(c) (OpaquePointer, UInt32) -> Double).self)
+    }
+}
+
+// MARK: - SMC Struct (80 bytes, matches C SMCKeyData_t layout)
 //
-// Must exactly match the C layout of SMCKeyData_t (80 bytes).
-// Explicit padding fields are used to reproduce the compiler-inserted gaps:
-//   _pad0 (2 bytes): aligns SMCPLimitData to a 4-byte boundary after SMCVersion
-//   _pad1 (3 bytes): aligns data32 to a 4-byte boundary after data8
+// Explicit padding fields reproduce compiler-inserted alignment gaps:
+//   _pad0: aligns SMCPLimitData to 4-byte boundary after SMCVersion
+//   _pad1: aligns data32 to 4-byte boundary after data8
+
 private struct SMCKeyData {
     typealias Bytes = (
         UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8,
@@ -116,30 +186,19 @@ private struct SMCKeyData {
         UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8,
         UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8
     )
-
-    var key: UInt32 = 0                              // offset  0
-    var vers_major: UInt8 = 0                        // offset  4
-    var vers_minor: UInt8 = 0                        // offset  5
-    var vers_build: UInt8 = 0                        // offset  6
-    var vers_reserved: UInt8 = 0                     // offset  7
-    var vers_release: UInt16 = 0                     // offset  8
-    var _pad0: UInt16 = 0                            // offset 10 – aligns pLimitData to 12
-    var pLimit_version: UInt16 = 0                   // offset 12
-    var pLimit_length: UInt16 = 0                    // offset 14
-    var pLimit_cpuPLimit: UInt32 = 0                 // offset 16
-    var pLimit_gpuPLimit: UInt32 = 0                 // offset 20
-    var pLimit_memPLimit: UInt32 = 0                 // offset 24
-    var keyInfo_dataSize: UInt32 = 0                 // offset 28
-    var keyInfo_dataType: UInt32 = 0                 // offset 32
-    var keyInfo_dataAttr: UInt8 = 0                  // offset 36
-    var padding: UInt8 = 0                           // offset 37
-    var result: UInt8 = 0                            // offset 38
-    var status: UInt8 = 0                            // offset 39
-    var data8: UInt8 = 0                             // offset 40
-    var _pad1: (UInt8, UInt8, UInt8) = (0, 0, 0)    // offset 41 – aligns data32 to 44
-    var data32: UInt32 = 0                           // offset 44
-    var bytes: Bytes = (                             // offset 48
-        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0
-    )
+    var key: UInt32 = 0
+    var vers_major: UInt8 = 0;    var vers_minor: UInt8 = 0
+    var vers_build: UInt8 = 0;    var vers_reserved: UInt8 = 0
+    var vers_release: UInt16 = 0; var _pad0: UInt16 = 0
+    var pLimit_version: UInt16 = 0; var pLimit_length: UInt16 = 0
+    var pLimit_cpuPLimit: UInt32 = 0; var pLimit_gpuPLimit: UInt32 = 0
+    var pLimit_memPLimit: UInt32 = 0
+    var keyInfo_dataSize: UInt32 = 0; var keyInfo_dataType: UInt32 = 0
+    var keyInfo_dataAttr: UInt8 = 0
+    var padding: UInt8 = 0; var result: UInt8 = 0
+    var status: UInt8 = 0;  var data8: UInt8 = 0
+    var _pad1: (UInt8, UInt8, UInt8) = (0, 0, 0)
+    var data32: UInt32 = 0
+    var bytes: Bytes = (0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
+                        0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0)
 }

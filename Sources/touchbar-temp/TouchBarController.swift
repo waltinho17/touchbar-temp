@@ -1,10 +1,11 @@
 import AppKit
 import ObjectiveC
 
-final class TouchBarController: NSObject {
+final class TouchBarController: NSObject, NSTouchBarDelegate {
 
     private let itemID = NSTouchBarItem.Identifier("com.touchbar-temp.temperature")
-    private weak var tempLabel: NSTextField?
+    private var systemTrayItem: NSCustomTouchBarItem?  // must be retained
+    private weak var tempButton: NSButton?
     private var timer: Timer?
     private var reader: TemperatureReader?
 
@@ -19,7 +20,13 @@ final class TouchBarController: NSObject {
         self.reader = reader
 
         let item = makeItem()
-        addToSystemTray(item)
+        systemTrayItem = item
+
+        // Small delay so the Touch Bar system is fully initialised before we inject.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { [weak self] in
+            guard let self else { return }
+            self.addToSystemTray(item)
+        }
         scheduleTimer()
     }
 
@@ -27,28 +34,61 @@ final class TouchBarController: NSObject {
 
     private func makeItem() -> NSCustomTouchBarItem {
         let item = NSCustomTouchBarItem(identifier: itemID)
+        item.customizationLabel = "CPU Temperature"
 
-        let label = NSTextField(labelWithString: "–°")
-        label.font = heavyRoundedFont(size: 17)
-        label.textColor = .white
-        label.alignment = .center
-        label.sizeToFit()
+        // NSButton sizes itself correctly inside the Touch Bar;
+        // NSTextField with sizeToFit() can collapse to zero before layout.
+        let btn = NSButton(title: "–°", target: self, action: #selector(toggleColorsFromBar))
+        btn.bezelStyle = .rounded
+        btn.isBordered = false
+        btn.font = heavyRoundedFont(size: 17)
+        btn.contentTintColor = .white
 
-        tempLabel = label
-        item.view = label
+        tempButton = btn
+        item.view = btn
         return item
     }
 
-    // Adds a single item to the Touch Bar system tray area (right side, next to Siri).
-    // Uses NSTouchBarItem.addSystemTrayItem: — a private but stable API used by
-    // all major Touch Bar utilities (Pock, Silenz, etc.) since macOS 10.12.2.
-    private func addToSystemTray(_ item: NSCustomTouchBarItem) {
-        let sel = NSSelectorFromString("addSystemTrayItem:")
-        guard let method = class_getClassMethod(NSTouchBarItem.self, sel) else { return }
+    @objc private func toggleColorsFromBar() {
+        useColors.toggle()
+    }
 
+    // MARK: - System Tray Injection
+
+    // Tries addSystemTrayItem: on NSTouchBarItem (private, stable since 10.12.2).
+    // Falls back to the 2-arg presentSystemModalTouchBar:systemTrayItemIdentifier:
+    // which shows the item in the system tray without replacing the whole bar.
+    private func addToSystemTray(_ item: NSCustomTouchBarItem) {
+        if callClassMethod("addSystemTrayItem:", on: NSTouchBarItem.self, arg: item) { return }
+
+        // Fallback: 2-arg presentSystemModalTouchBar (no placement = system tray only)
+        let bar = NSTouchBar()
+        bar.delegate = self
+        bar.defaultItemIdentifiers = [itemID]
+
+        typealias PresentFn = @convention(c) (AnyObject, Selector, AnyObject?, NSString?) -> Void
+        let sel = NSSelectorFromString("presentSystemModalTouchBar:systemTrayItemIdentifier:")
+        guard let method = class_getClassMethod(NSTouchBar.self, sel) else { return }
+        let fn = unsafeBitCast(method_getImplementation(method), to: PresentFn.self)
+        fn(NSTouchBar.self, sel, bar, itemID.rawValue as NSString)
+    }
+
+    @discardableResult
+    private func callClassMethod(_ name: String, on cls: AnyClass, arg: AnyObject) -> Bool {
+        let sel = NSSelectorFromString(name)
+        guard let method = class_getClassMethod(cls, sel) else { return false }
         typealias Fn = @convention(c) (AnyObject, Selector, AnyObject) -> Void
         let fn = unsafeBitCast(method_getImplementation(method), to: Fn.self)
-        fn(NSTouchBarItem.self, sel, item)
+        fn(cls, sel, arg)
+        return true
+    }
+
+    // MARK: - NSTouchBarDelegate (fallback path)
+
+    func touchBar(_ touchBar: NSTouchBar,
+                  makeItemForIdentifier identifier: NSTouchBarItem.Identifier) -> NSTouchBarItem? {
+        guard identifier == itemID else { return nil }
+        return systemTrayItem
     }
 
     // MARK: - Timer
@@ -68,8 +108,9 @@ final class TouchBarController: NSObject {
 
         DispatchQueue.main.async { [weak self] in
             guard let self else { return }
-            self.tempLabel?.stringValue = temp > 0 ? String(format: "%.0f°", temp) : "–°"
-            self.tempLabel?.textColor = self.useColors ? self.color(for: temp) : .white
+            let title = temp > 0 ? String(format: "%.0f°", temp) : "–°"
+            self.tempButton?.title = title
+            self.tempButton?.contentTintColor = self.useColors ? self.color(for: temp) : .white
         }
     }
 
@@ -79,6 +120,8 @@ final class TouchBarController: NSObject {
         if temp < 85 { return .systemOrange }
         return .systemRed
     }
+
+    // MARK: - Font
 
     // SF Pro Rounded Heavy — native macOS look, no external font needed
     private func heavyRoundedFont(size: CGFloat) -> NSFont {
