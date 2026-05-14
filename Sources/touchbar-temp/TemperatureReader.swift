@@ -9,10 +9,12 @@ final class TemperatureReader {
     private var connected = false
 
     // Intel: TC0P (CPU proximity), TC0D/E/F (CPU die)
-    // Apple Silicon M1/M2: Tp01/05, Te05/09 (efficiency/performance cores)
+    // Apple Silicon M1/M2: Tp01–Tp0r (PMIC), Tf04/Tf09 (P-cores/E-cores), Te05/Te09
     private let candidateKeys = ["TC0P", "TC0D", "TC0E", "TC0F",
-                                  "Tp01", "Tp05", "Tp0D", "Tp0b",
-                                  "Te05", "Te09", "Tf04", "Tf09"]
+                                  "Tp01", "Tp05", "Tp09", "Tp0D", "Tp0T",
+                                  "Tp0b", "Tp0d", "Tp0f", "Tp0h", "Tp0j",
+                                  "Tf04", "Tf09", "Tf0A", "Tf0B",
+                                  "Te05", "Te09"]
     private var cachedKey: String?
 
     init() {

@@ -1,11 +1,10 @@
 import AppKit
 import ObjectiveC
 
-final class TouchBarController: NSObject, NSTouchBarDelegate {
+final class TouchBarController: NSObject {
 
     private let itemID = NSTouchBarItem.Identifier("com.touchbar-temp.temperature")
     private weak var tempLabel: NSTextField?
-    private var touchBar: NSTouchBar?
     private var timer: Timer?
     private var reader: TemperatureReader?
 
@@ -19,34 +18,37 @@ final class TouchBarController: NSObject, NSTouchBarDelegate {
     func start(reader: TemperatureReader) {
         self.reader = reader
 
-        touchBar = NSTouchBar()
-        touchBar?.delegate = self
-        touchBar?.defaultItemIdentifiers = [itemID]
-
-        presentInSystemTray()
+        let item = makeItem()
+        addToSystemTray(item)
         scheduleTimer()
     }
 
-    // MARK: - Touch Bar Presentation
+    // MARK: - Touch Bar Item
 
-    // presentSystemModalTouchBar:placement:systemTrayItemIdentifier: is a documented
-    // AppKit API (macOS 10.12.2+) but not always bridged in Swift headers.
-    // We call it via ObjC runtime to stay forward-compatible.
-    private func presentInSystemTray() {
-        guard let tb = touchBar else { return }
+    private func makeItem() -> NSCustomTouchBarItem {
+        let item = NSCustomTouchBarItem(identifier: itemID)
 
-        let selName = "presentSystemModalTouchBar:placement:systemTrayItemIdentifier:"
-        let sel = NSSelectorFromString(selName)
+        let label = NSTextField(labelWithString: "–°")
+        label.font = heavyRoundedFont(size: 17)
+        label.textColor = .white
+        label.alignment = .center
+        label.sizeToFit()
 
-        guard let method = class_getClassMethod(NSTouchBar.self, sel) else {
-            // Touch Bar not supported on this machine.
-            return
-        }
+        tempLabel = label
+        item.view = label
+        return item
+    }
 
-        typealias PresentFn = @convention(c) (AnyObject, Selector, AnyObject?, Int64, NSString?) -> Void
-        let imp = method_getImplementation(method)
-        let fn = unsafeBitCast(imp, to: PresentFn.self)
-        fn(NSTouchBar.self, sel, tb, 1, itemID.rawValue as NSString)
+    // Adds a single item to the Touch Bar system tray area (right side, next to Siri).
+    // Uses NSTouchBarItem.addSystemTrayItem: — a private but stable API used by
+    // all major Touch Bar utilities (Pock, Silenz, etc.) since macOS 10.12.2.
+    private func addToSystemTray(_ item: NSCustomTouchBarItem) {
+        let sel = NSSelectorFromString("addSystemTrayItem:")
+        guard let method = class_getClassMethod(NSTouchBarItem.self, sel) else { return }
+
+        typealias Fn = @convention(c) (AnyObject, Selector, AnyObject) -> Void
+        let fn = unsafeBitCast(method_getImplementation(method), to: Fn.self)
+        fn(NSTouchBarItem.self, sel, item)
     }
 
     // MARK: - Timer
@@ -76,25 +78,6 @@ final class TouchBarController: NSObject, NSTouchBarDelegate {
         if temp < 70 { return .systemGreen }
         if temp < 85 { return .systemOrange }
         return .systemRed
-    }
-
-    // MARK: - NSTouchBarDelegate
-
-    func touchBar(_ touchBar: NSTouchBar,
-                  makeItemForIdentifier identifier: NSTouchBarItem.Identifier) -> NSTouchBarItem? {
-        guard identifier == itemID else { return nil }
-
-        let item = NSCustomTouchBarItem(identifier: identifier)
-
-        let label = NSTextField(labelWithString: "–°")
-        label.font = heavyRoundedFont(size: 17)
-        label.textColor = .white
-        label.alignment = .center
-        label.sizeToFit()
-
-        tempLabel = label
-        item.view = label
-        return item
     }
 
     // SF Pro Rounded Heavy — native macOS look, no external font needed
